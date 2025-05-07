@@ -1,0 +1,3 @@
+python-dotenv
+revolt.py
+openai
