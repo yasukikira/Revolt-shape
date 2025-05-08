@@ -1,99 +1,178 @@
+import discord
+from discord.ext import commands
 import os
-import revolt
 from dotenv import load_dotenv
-from openai import OpenAI
 import asyncio
+import logging
 
-print("--- SCRIPT STARTING - DEBUG MODE ---")
-print("Attempting to load .env file (for local testing, Choreo uses platform env vars)...")
-load_dotenv() # This is mainly for local, Choreo provides them directly
-
-print("\n--- PRINTING ALL ENVIRONMENT VARIABLES SEEN BY THE SCRIPT ---")
-for key, value in os.environ.items():
-    # For security, let's only print full values for the ones we care about or partially hide others
-    if key in ["REVOLT_TOKEN", "SHAPESINC_API_KEY", "SHAPESINC_SHAPE_USERNAME"]:
-        print(f"ENV VAR: {key} = {value}")
-    elif "TOKEN" in key.upper() or "KEY" in key.upper() or "SECRET" in key.upper():
-        print(f"ENV VAR: {key} = {value[:3]}...{value[-3:] if len(value) > 6 else ''} (partially hidden)")
-    # else:
-    # print(f"ENV VAR: {key} = {value}") # Uncomment to see all other env vars, can be noisy
-
-print("\n--- CHECKING SPECIFIC EXPECTED ENVIRONMENT VARIABLES ---")
-
-REVOLT_TOKEN = os.getenv("REVOLT_TOKEN")
-SHAPES_API_KEY = os.getenv("SHAPESINC_API_KEY")
-SHAPES_USERNAME = os.getenv("SHAPESINC_SHAPE_USERNAME")
-
-print(f"Value of REVOLT_TOKEN: {REVOLT_TOKEN}")
-print(f"Value of SHAPESINC_API_KEY: {SHAPES_API_KEY[:5] + '...' if SHAPES_API_KEY else None}") # Print part of API key
-print(f"Value of SHAPESINC_SHAPE_USERNAME: {SHAPES_USERNAME}")
+# --- Basic Logging Setup ---
+# On Choreo.dev, this will output to the platform's logging stream
+logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
+logger = logging.getLogger('discord')
 
 
-if not all([REVOLT_TOKEN, SHAPES_API_KEY, SHAPES_USERNAME]):
-    print("\n--- ERROR DETECTED ---")
-    print("Error: Missing one or more environment variables. See values above.")
-    if not REVOLT_TOKEN:
-        print("REVOLT_TOKEN is missing or empty.")
-    if not SHAPES_API_KEY:
-        print("SHAPESINC_API_KEY is missing or empty.")
-    if not SHAPES_USERNAME:
-        print("SHAPESINC_SHAPE_USERNAME is missing or empty.")
-    print("--- SCRIPT EXITING DUE TO MISSING ENV VARS ---")
-    exit(1)
-else:
-    print("\n--- SUCCESS: All required environment variables found. ---")
+# --- Load Environment Variables ---
+# load_dotenv() will load from .env for local development
+# On Choreo.dev, os.getenv will pick up variables set in the platform's environment
+load_dotenv()
 
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+PREFIX = os.getenv('COMMAND_PREFIX', '!') # Default to '!' if not set
+BOT_COLOR_STR = os.getenv('BOT_COLOR', '0x7289DA') # Default to Blurple
 
-# --- The rest of your bot code would normally go here ---
-# For now, we can stop to focus on env vars. If they are found, the bot will proceed.
-
-SHAPES_MODEL_NAME = f"shapesinc/{SHAPES_USERNAME}"
-SHAPES_BASE_URL = "https://api.shapes.inc/v1/"
-
+# Validate that BOT_COLOR_STR is a valid hex before conversion
 try:
-    shapes_client = OpenAI(
-        api_key=SHAPES_API_KEY,
-        base_url=SHAPES_BASE_URL,
-    )
-    shapes_api_available = True
-    print("Shapes API client initialized.")
-except Exception as e:
-    print(f"Error initializing Shapes API client: {e}")
-    shapes_client = None
-    shapes_api_available = False
-
-class ShapesBotClient(revolt.Client):
-    async def on_ready(self):
-        print(f"Logged in as {self.user.name} (ID: {self.user.id})")
-        print("Bot is ready to receive messages.")
-        if not shapes_api_available:
-            print("WARNING: Shapes API client not initialized. Shape interactions will fail.")
-    # ... (rest of your on_message and other methods) ...
-    async def on_message(self, message: revolt.Message):
-        if message.author.bot: return
-        is_dm = isinstance(message.channel, revolt.DMChannel)
-        is_mentioned = self.user.id in message.mention_ids
-        if is_dm or is_mentioned:
-            print(f"Bot triggered by {'DM' if is_dm else 'mention'} from {message.author.name}")
-            await message.reply(f"Env vars look OK! You said: {message.content}", mention=False)
+    BOT_COLOR = int(BOT_COLOR_STR, 16)
+except ValueError:
+    logger.warning(f"Invalid BOT_COLOR format: '{BOT_COLOR_STR}'. Using default Blurple (0x7289DA).")
+    BOT_COLOR = 0x7289DA
 
 
+if not TOKEN:
+    logger.critical("FATAL ERROR: DISCORD_BOT_TOKEN not found. Ensure it's set in your environment variables (e.g., .env locally, or platform settings on Choreo.dev).")
+    exit() # Critical failure, bot cannot start
+if not OPENROUTER_API_KEY:
+    # Non-critical, lyrics command will just inform user API key is missing
+    logger.warning("WARNING: OPENROUTER_API_KEY not found. Lyrics command will not function.")
+
+# --- Bot Intents ---
+intents = discord.Intents.default()
+intents.message_content = True # Required for reading message content for commands
+intents.voice_states = True    # Required for voice channel operations
+
+# --- Bot Initialization ---
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+# --- Global Bot Attributes (accessible in cogs) ---
+bot.bot_color = discord.Color(BOT_COLOR)
+bot.openrouter_api_key = OPENROUTER_API_KEY # Pass API key to cogs
+
+# --- Event: Bot Ready ---
+@bot.event
+async def on_ready():
+    logger.info(f'{bot.user.name} has connected to Discord!')
+    logger.info(f'Bot ID: {bot.user.id}')
+    logger.info(f'Command Prefix: {PREFIX}')
+    logger.info(f'Using Bot Color: #{BOT_COLOR:06X}')
+    if not bot.openrouter_api_key:
+        logger.warning("OpenRouter API Key is not set. The 'lyrics' command will be unavailable.")
+    await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help | Groovin'"))
+    logger.info("Presence updated.")
+    logger.info("IMPORTANT FOR CHOREO.DEV (and similar platforms): Ensure FFmpeg is installed in your deployment environment, or music playback will fail!")
+
+
+# --- Load Cogs ---
+async def load_cogs():
+    logger.info("Attempting to load cogs...")
+    for filename in os.listdir('./cogs'):
+        if filename.endswith('.py') and not filename.startswith('_'): # Ignore files like __init__.py
+            cog_name = filename[:-3]
+            try:
+                await bot.load_extension(f'cogs.{cog_name}')
+                logger.info(f'Successfully loaded cog: {cog_name}')
+            except commands.ExtensionAlreadyLoaded:
+                logger.info(f'Cog {cog_name} already loaded.')
+            except Exception as e:
+                logger.error(f'Failed to load cog {cog_name}: {e}', exc_info=True) # Log full traceback
+
+# --- Custom Help Command ---
+@bot.command(name="help")
+async def custom_help(ctx, *, command_name: str = None):
+    """Shows this message or info about a command."""
+    embed = discord.Embed(title="🎧 MelodyMaestro Help 🎧", color=bot.bot_color)
+    
+    if command_name:
+        command = bot.get_command(command_name)
+        if command and not command.hidden:
+            embed.title = f"Help: {PREFIX}{command.qualified_name}" # Use qualified_name for subcommands if any
+            aliases = ", ".join([PREFIX + alias for alias in command.aliases]) if command.aliases else "None"
+            # Construct usage string carefully
+            params = command.signature
+            usage = f"{PREFIX}{command.qualified_name} {params}"
+            
+            description = command.help or command.short_doc or 'No description provided.'
+            embed.description = f"{description}\n\n**Usage:** `{usage}`\n**Aliases:** {aliases}"
+        else:
+            embed.description = f"Sorry, I couldn't find a command called `{command_name}` or it's hidden."
+            embed.color = discord.Color.red()
+    else:
+        embed.description = f"Hi {ctx.author.mention}! I'm MelodyMaestro, your personal DJ.\nUse `{PREFIX}help <command>` for more info on a specific command."
+        
+        # Categorize commands by cog
+        for cog_name, cog_instance in bot.cogs.items():
+            visible_commands = [cmd for cmd in cog_instance.get_commands() if not cmd.hidden]
+            if visible_commands:
+                cmd_list = []
+                for cmd in sorted(visible_commands, key=lambda c: c.name): # Sort commands alphabetically
+                    cmd_list.append(f"`{PREFIX}{cmd.name}` - {cmd.short_doc or 'No short description.'}")
+                embed.add_field(name=f"🎵 {cog_name} Commands", value="\n".join(cmd_list), inline=False)
+        
+        embed.set_footer(text="Rock on! 🤘 | Built by YourName", icon_url=bot.user.avatar.url if bot.user.avatar else None) # Optional: add your name
+
+    await ctx.send(embed=embed)
+
+# --- Global Error Handler (Optional, but good practice) ---
+@bot.event
+async def on_command_error(ctx, error):
+    if hasattr(ctx.command, 'on_error'): # If command has its own error handler, let it handle it
+        return
+
+    # This prevents any commands with local handlers being handled here.
+    cog = ctx.cog
+    if cog:
+        if cog._get_overridden_method(cog.cog_command_error) is not None:
+            return # Let cog-specific error handler take over
+
+    error = getattr(error, 'original', error) # Get original error if it's wrapped
+
+    if isinstance(error, commands.CommandNotFound):
+        # Optional: send a message or just log and ignore
+        # await ctx.send(embed=discord.Embed(title="🤷 Unknown Command", description=f"Sorry, I don't know the command `{ctx.invoked_with}`.", color=discord.Color.orange()))
+        logger.warning(f"CommandNotFound: {ctx.invoked_with} by {ctx.author}")
+        return
+    elif isinstance(error, commands.DisabledCommand):
+        await ctx.send(embed=discord.Embed(title="🚫 Command Disabled", description=f"`{ctx.command}` is currently disabled.", color=discord.Color.orange()))
+    elif isinstance(error, commands.NoPrivateMessage):
+        try:
+            await ctx.author.send(embed=discord.Embed(title="🚫 DMs Not Allowed", description=f"`{ctx.command}` cannot be used in Direct Messages.", color=discord.Color.red()))
+        except discord.Forbidden:
+            pass # Can't send DMs to the user
+    elif isinstance(error, commands.MissingPermissions):
+        perms_needed = "\n".join([f"- {perm.replace('_', ' ').title()}" for perm in error.missing_permissions])
+        embed = discord.Embed(title="🚫 Missing Permissions",
+                              description=f"You are missing the following permission(s) to run this command:\n{perms_needed}",
+                              color=discord.Color.red())
+        await ctx.send(embed=embed)
+    elif isinstance(error, commands.BotMissingPermissions):
+        perms_needed = "\n".join([f"- {perm.replace('_', ' ').title()}" for perm in error.missing_permissions])
+        embed = discord.Embed(title="🤖 Bot Missing Permissions",
+                              description=f"I am missing the following permission(s) to run this command:\n{perms_needed}\nPlease grant them to me!",
+                              color=discord.Color.red())
+        await ctx.send(embed=embed)
+    else:
+        # For other errors, log them and inform the user generically
+        logger.error(f"Unhandled error in command {ctx.command}: {error}", exc_info=True)
+        embed = discord.Embed(title="🔥 Oops! An Error Occurred",
+                              description="Something went wrong while trying to run that command. The developers have been notified.",
+                              color=discord.Color.dark_red())
+        embed.set_footer(text="If this persists, please report it.")
+        await ctx.send(embed=embed)
+
+
+# --- Main Execution ---
 async def main():
-    client = ShapesBotClient()
-    print("Starting bot with (presumably) correct env vars...")
-    try:
-        await client.start(REVOLT_TOKEN)
-    except revolt.errors.LoginError as e:
-        print(f"Failed to log in: {e}. Please check your REVOLT_TOKEN's VALUE.")
-    except Exception as e:
-        print(f"An error occurred while starting or running the bot: {e}")
-    finally:
-        print("Bot is shutting down or encountered a critical error.")
-        if client.is_ready():
-            await client.close()
+    async with bot:
+        await load_cogs()
+        logger.info("Starting bot...")
+        await bot.start(TOKEN)
 
 if __name__ == "__main__":
+    # Add a reminder about FFmpeg for local runs too
+    logger.info("Reminder: Ensure FFmpeg is installed and in your system's PATH for music functionality.")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Bot shutdown requested by user (Ctrl+C).")
+        logger.info("Bot shutting down via KeyboardInterrupt...")
+    except Exception as e:
+        logger.critical(f"An unrecoverable error occurred during bot startup or runtime: {e}", exc_info=True)
